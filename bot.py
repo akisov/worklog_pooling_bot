@@ -8,6 +8,21 @@ import aiohttp
 import asyncio
 import time
 
+# Функция для правильного склонения слова "час"
+def format_hours(hours):
+    """Возвращает правильное склонение слова 'час' в зависимости от числового значения"""
+    hours_int = int(hours)
+    remainder = hours_int % 10
+    
+    if hours_int % 100 in [11, 12, 13, 14]:
+        return f"{hours:.2f} часов"
+    elif remainder == 1:
+        return f"{hours:.2f} час"
+    elif remainder in [2, 3, 4]:
+        return f"{hours:.2f} часа"
+    else:
+        return f"{hours:.2f} часов"
+
 # Параметры запроса
 url = 'https://api.tracker.yandex.net/v2/worklog'
 url_user_info = 'https://api.tracker.yandex.net/v2/users/8000000000000066'  # Пример URL для получения информации о пользователе
@@ -61,48 +76,44 @@ def get_worklog_info(login):
     tomorrow = today + timedelta(days=1)
     end_of_month = f"{year_for_request}-{current_month:02d}-{tomorrow.day:02d}"  # Завтрашний день, но в 2025 году
     
+    # Определяем дату, с которой начинаются "последние 2 дня"
+    two_days_ago = today - timedelta(days=2)
+    two_days_ago_str = f"{year_for_request}-{two_days_ago.month:02d}-{two_days_ago.day:02d}"
+    
     print(f"Запрос данных для {login} с {start_of_month} по {end_of_month} (год: {year_for_request}, месяц: {current_month})")
 
-    # Разбиваем период на интервалы по 3 дня
-    start_date_obj = datetime.strptime(start_of_month, "%Y-%m-%d")
-    end_date_obj = datetime.strptime(end_of_month, "%Y-%m-%d")
-    
-    # Создаем список интервалов по 3 дня, где дата начала нового периода совпадает с датой окончания предыдущего
-    intervals = []
-    current_start = start_date_obj
-    
-    while current_start < end_date_obj:
-        # Определяем конец текущего интервала (через 3 дня или до конца периода)
-        current_end = min(current_start + timedelta(days=3), end_date_obj)
-        intervals.append((current_start, current_end))
-        # Новый интервал начинается с даты окончания предыдущего
-        current_start = current_end
-    
-    # Собираем данные за все интервалы
+    # Проверяем наличие кеша и его актуальность
     all_worklogs = []
+    need_full_update = not is_cache_valid(login)
     
-    for start_interval, end_interval in intervals:
-        start_str = start_interval.strftime("%Y-%m-%d")
-        end_str = end_interval.strftime("%Y-%m-%d")
+    if need_full_update:
+        print(f"Кеш для {login} отсутствует или устарел, запрашиваем все данные")
+        # Если кеш отсутствует или устарел, запрашиваем все данные
+        all_worklogs = fetch_all_worklogs(login, start_of_month, end_of_month)
         
-        print(f"Запрос данных для интервала: {start_str} - {end_str}")
+        # Разделяем данные на "старые" (до последних 2 дней) и "новые" (последние 2 дня)
+        month_data = [log for log in all_worklogs if log['createdAt'][:10] < two_days_ago_str]
+        recent_data = [log for log in all_worklogs if log['createdAt'][:10] >= two_days_ago_str]
         
-        # Используем список кортежей для параметров
-        params = [
-            ('createdBy', login),
-            ('createdAt', f'from:{start_str}'),
-            ('createdAt', f'to:{end_str}')
-        ]
-
-        # Используем GET-запрос
-        response = requests.get(url, headers=headers, params=params)
-
-        if response.status_code == 200:
-            worklogs = response.json()
-            print(f"Получено {len(worklogs)} записей для интервала {start_str} - {end_str}")
-            all_worklogs.extend(worklogs)
-        else:
-            print(f"Ошибка при запросе интервала {start_str} - {end_str}: {response.status_code} - {response.text}")
+        # Обновляем кеш
+        worklog_cache[login] = {
+            'data': all_worklogs,
+            'month_data': month_data,
+            'recent_data': recent_data,
+            'timestamp': time.time()
+        }
+    else:
+        print(f"Используем кеш для {login}, обновляем только данные за последние 2 дня")
+        # Если кеш актуален, запрашиваем только данные за последние 2 дня
+        recent_data = fetch_all_worklogs(login, two_days_ago_str, end_of_month)
+        
+        # Объединяем "старые" данные из кеша с новыми данными за последние 2 дня
+        all_worklogs = worklog_cache[login]['month_data'] + recent_data
+        
+        # Обновляем кеш
+        worklog_cache[login]['data'] = all_worklogs
+        worklog_cache[login]['recent_data'] = recent_data
+        worklog_cache[login]['timestamp'] = time.time()
     
     print(f"Всего получено {len(all_worklogs)} записей для {login}")
     
@@ -135,6 +146,8 @@ def get_worklog_info(login):
     }
 
     # Пересчитываем общее количество рабочих часов с учетом сокращенных дней
+    start_date_obj = datetime.strptime(start_of_month, "%Y-%m-%d")
+    end_date_obj = datetime.strptime(end_of_month, "%Y-%m-%d")
     total_working_hours = 0
     current_date = start_date_obj
     while current_date <= end_date_obj:
@@ -174,14 +187,8 @@ def get_worklog_info(login):
         else:
             duration_hours = isodate.parse_duration(duration).total_seconds() / 3600
 
-        # Новый запрос для получения типа задачи
-        issue_url = f"https://api.tracker.yandex.net/v2/issues/{issue_key}"
-        issue_response = requests.get(issue_url, headers=headers)
-        if issue_response.status_code == 200:
-            issue_data = issue_response.json()
-            issue_type_display = issue_data['type'].get('display', 'Неизвестно')
-        else:
-            issue_type_display = 'Неизвестно'
+        # Проверяем, есть ли информация о типе задачи в кеше
+        issue_type_display = get_issue_type(issue_key)
 
         if created_at not in daily_durations:
             daily_durations[created_at] = {}
@@ -193,7 +200,7 @@ def get_worklog_info(login):
     for date, issues in daily_durations.items():
         details += f"\nДата: {date}\n"
         for issue_key, data in issues.items():
-            details += f"  Задача: {issue_key}, Тип: {data['type']}, Время: {data['hours']:.2f} часов\n"
+            details += f"  Задача: {issue_key}, Тип: {data['type']}, Время: {format_hours(data['hours'])}\n"
 
     print(f"Обработка данных для {login}:")
     print(f"Общее время: {total_duration} часов")
@@ -201,7 +208,71 @@ def get_worklog_info(login):
     print(f"Норма выработки: {production_norm} часов")
     print(f"Выработка по норме: {production_rate}%")
 
-    return f"⏰ Суммарное время: {total_duration:.2f} часов\n📊 Выработка по норме: {production_rate:.2f}%\n{details}"
+    return f"⏰ Суммарное время: {format_hours(total_duration)}\n📊 Выработка по норме: {production_rate:.2f}%\n{details}"
+
+def fetch_all_worklogs(login, start_date, end_date):
+    """Получает все записи о работе для указанного пользователя за указанный период"""
+    start_date_obj = datetime.strptime(start_date, "%Y-%m-%d")
+    end_date_obj = datetime.strptime(end_date, "%Y-%m-%d")
+    
+    # Создаем список интервалов по 3 дня, где дата начала нового периода совпадает с датой окончания предыдущего
+    intervals = []
+    current_start = start_date_obj
+    
+    while current_start < end_date_obj:
+        # Определяем конец текущего интервала (через 3 дня или до конца периода)
+        current_end = min(current_start + timedelta(days=3), end_date_obj)
+        intervals.append((current_start, current_end))
+        # Новый интервал начинается с даты окончания предыдущего
+        current_start = current_end
+    
+    # Собираем данные за все интервалы
+    all_worklogs = []
+    
+    for start_interval, end_interval in intervals:
+        start_str = start_interval.strftime("%Y-%m-%d")
+        end_str = end_interval.strftime("%Y-%m-%d")
+        
+        print(f"Запрос данных для интервала: {start_str} - {end_str}")
+        
+        # Используем список кортежей для параметров
+        params = [
+            ('createdBy', login),
+            ('createdAt', f'from:{start_str}'),
+            ('createdAt', f'to:{end_str}')
+        ]
+
+        # Используем GET-запрос
+        response = requests.get(url, headers=headers, params=params)
+
+        if response.status_code == 200:
+            worklogs = response.json()
+            print(f"Получено {len(worklogs)} записей для интервала {start_str} - {end_str}")
+            all_worklogs.extend(worklogs)
+        else:
+            print(f"Ошибка при запросе интервала {start_str} - {end_str}: {response.status_code} - {response.text}")
+    
+    return all_worklogs
+
+# Кеш для типов задач
+issue_type_cache = {}
+
+def get_issue_type(issue_key):
+    """Получает тип задачи с использованием кеширования"""
+    if issue_key in issue_type_cache:
+        return issue_type_cache[issue_key]
+    
+    # Если тип задачи не найден в кеше, запрашиваем его
+    issue_url = f"https://api.tracker.yandex.net/v2/issues/{issue_key}"
+    issue_response = requests.get(issue_url, headers=headers)
+    if issue_response.status_code == 200:
+        issue_data = issue_response.json()
+        issue_type_display = issue_data['type'].get('display', 'Неизвестно')
+        # Сохраняем в кеш
+        issue_type_cache[issue_key] = issue_type_display
+        return issue_type_display
+    else:
+        return 'Неизвестно'
 
 def get_summary_info(login):
     # Обновляем URL для получения информации о пользователе
@@ -228,12 +299,24 @@ def get_worklog_details(login):
     return worklog_info[details_start:]
 
 async def fetch_user_info(session, login):
+    # Проверяем наличие кеша и его актуальность
+    if is_cache_valid(login, 'user_info'):
+        print(f"Используем кешированную информацию о пользователе {login}")
+        return user_info_cache[login]['data']
+    
+    # Если кеш отсутствует или устарел, запрашиваем данные
     url_user_info = f'https://api.tracker.yandex.net/v2/users/{login}'
     async with session.get(url_user_info, headers=headers) as response:
         if response.status == 200:
-            return await response.json()
+            user_info = await response.json()
+            # Обновляем кеш
+            user_info_cache[login] = {
+                'data': user_info,
+                'timestamp': time.time()
+            }
+            return user_info
         else:
-            print(f"Ошибка при получении self URL для {login}: {response.status} - {await response.text()}")
+            print(f"Ошибка при получении информации о пользователе {login}: {response.status} - {await response.text()}")
             return None
 
 async def fetch_worklog_info(session, login):
@@ -248,11 +331,52 @@ async def fetch_worklog_info(session, login):
     tomorrow = today + timedelta(days=1)
     end_of_month = f"{year_for_request}-{current_month:02d}-{tomorrow.day:02d}"  # Завтрашний день, но в 2025 году
     
+    # Определяем дату, с которой начинаются "последние 2 дня"
+    two_days_ago = today - timedelta(days=2)
+    two_days_ago_str = f"{year_for_request}-{two_days_ago.month:02d}-{two_days_ago.day:02d}"
+    
     print(f"Запрос данных для {login} с {start_of_month} по {end_of_month} (год: {year_for_request}, месяц: {current_month})")
 
-    # Разбиваем период на интервалы по 3 дня
-    start_date_obj = datetime.strptime(start_of_month, "%Y-%m-%d")
-    end_date_obj = datetime.strptime(end_of_month, "%Y-%m-%d")
+    # Проверяем наличие кеша и его актуальность
+    all_worklogs = []
+    need_full_update = not is_cache_valid(login)
+    
+    if need_full_update:
+        print(f"Кеш для {login} отсутствует или устарел, запрашиваем все данные")
+        # Если кеш отсутствует или устарел, запрашиваем все данные
+        all_worklogs = await fetch_all_worklogs_async(session, login, start_of_month, end_of_month)
+        
+        # Разделяем данные на "старые" (до последних 2 дней) и "новые" (последние 2 дня)
+        month_data = [log for log in all_worklogs if log['createdAt'][:10] < two_days_ago_str]
+        recent_data = [log for log in all_worklogs if log['createdAt'][:10] >= two_days_ago_str]
+        
+        # Обновляем кеш
+        worklog_cache[login] = {
+            'data': all_worklogs,
+            'month_data': month_data,
+            'recent_data': recent_data,
+            'timestamp': time.time()
+        }
+    else:
+        print(f"Используем кеш для {login}, обновляем только данные за последние 2 дня")
+        # Если кеш актуален, запрашиваем только данные за последние 2 дня
+        recent_data = await fetch_all_worklogs_async(session, login, two_days_ago_str, end_of_month)
+        
+        # Объединяем "старые" данные из кеша с новыми данными за последние 2 дня
+        all_worklogs = worklog_cache[login]['month_data'] + recent_data
+        
+        # Обновляем кеш
+        worklog_cache[login]['data'] = all_worklogs
+        worklog_cache[login]['recent_data'] = recent_data
+        worklog_cache[login]['timestamp'] = time.time()
+    
+    print(f"Всего получено {len(all_worklogs)} записей для {login}")
+    return all_worklogs
+
+async def fetch_all_worklogs_async(session, login, start_date, end_date):
+    """Асинхронно получает все записи о работе для указанного пользователя за указанный период"""
+    start_date_obj = datetime.strptime(start_date, "%Y-%m-%d")
+    end_date_obj = datetime.strptime(end_date, "%Y-%m-%d")
     
     # Создаем список интервалов по 3 дня, где дата начала нового периода совпадает с датой окончания предыдущего
     intervals = []
@@ -290,7 +414,6 @@ async def fetch_worklog_info(session, login):
             else:
                 print(f"Ошибка при запросе интервала {start_str} - {end_str}: {response.status} - {await response.text()}")
     
-    print(f"Всего получено {len(all_worklogs)} записей для {login}")
     return all_worklogs
 
 async def get_summary_info_async(session, login):
@@ -362,7 +485,7 @@ async def get_summary_info_async(session, login):
             print(f"Рабочие дни: {total_working_hours} часов")
             print(f"Норма выработки: {production_norm} часов")
             print(f"Выработка по норме: {production_rate}%")
-            return f"👤 ФИО: {full_name}\n💼 Должность: {position}\n🔑 Логин: {login}\n⏰ Суммарное время: {total_duration:.2f} часов\n📊 Выработка по норме: {production_rate:.2f}%"
+            return f"👤 ФИО: {full_name}\n💼 Должность: {position}\n🔑 Логин: {login}\n⏰ Суммарное время: {format_hours(total_duration)}\n📊 Выработка по норме: {production_rate:.2f}%"
     return "Ошибка при получении данных"
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
